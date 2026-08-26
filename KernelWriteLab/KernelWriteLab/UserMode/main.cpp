@@ -131,6 +131,7 @@ void PrintUsage(const char* exeName) {
 int main(int argc, char** argv) {
     ULONG64 requestedValue = kDefaultWriteValue;
     ULONG64 explicitAddress = 0;
+    ULONG64 targetAddress = 0;
     bool hasExplicitAddress = false;
     int slotCount = 1;
 
@@ -269,14 +270,26 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "[*] Kernel session attached. Reloading symbols...\n";
-    hr = symbols->Reload("/f nt; .reload /f MyLabDriver.sys");
+    hr = symbols->Reload("/f nt");
     if (FAILED(hr)) {
-        std::cerr << "[!] Symbol reload returned HRESULT=0x"
+        std::cerr << "[!] nt symbol reload returned HRESULT=0x"
                   << std::hex << std::uppercase << static_cast<unsigned long>(hr)
                   << std::dec << std::nouppercase << "; continuing.\n";
     }
 
-    ULONG64 targetAddress = 0;
+    if (!hasExplicitAddress) {
+        hr = symbols->Reload("/f MyLabDriver.sys");
+        if (FAILED(hr)) {
+            std::cerr << "[!] MyLabDriver.sys symbol reload returned HRESULT=0x"
+                      << std::hex << std::uppercase << static_cast<unsigned long>(hr)
+                      << std::dec << std::nouppercase << "; continuing.\n";
+        }
+    }
+
+    // Reload warnings above are non-fatal; clear hr so a warning-only failure
+    // does not leak into the final exit code below.
+    hr = S_OK;
+
     if (hasExplicitAddress) {
         targetAddress = explicitAddress;
         std::cout << "[*] Using explicit address 0x"
