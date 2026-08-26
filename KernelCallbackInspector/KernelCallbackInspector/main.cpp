@@ -505,6 +505,73 @@ namespace {
 
     /*
      * ------------------------------------------------------------
+     * Resolve nt!_EX_CALLBACK_ROUTINE_BLOCK::Function offset from
+     * type information rather than hard-coding it.
+     *
+     * The struct layout is undocumented; if a future Windows build
+     * changes it, hard-coding 0x08 would silently misinterpret the
+     * callback array. Ask DbgEng for the offset and fall back to
+     * 0x08 only if type info is unavailable.
+     * ------------------------------------------------------------
+     */
+
+    ULONG ResolveCallbackFunctionOffset(
+        IDebugSymbols3* symbols)
+    {
+        ULONG typeId = 0;
+        ULONG64 moduleBase = 0;
+
+        HRESULT hr = symbols->GetSymbolTypeId(
+            "nt!_EX_CALLBACK_ROUTINE_BLOCK",
+            &typeId,
+            &moduleBase);
+
+        if (FAILED(hr)) {
+            std::cout
+                << "[!] nt!_EX_CALLBACK_ROUTINE_BLOCK type not available; "
+                "falling back to assumed callback offset 0x"
+                << std::hex
+                << kCallbackFunctionOffset
+                << std::dec
+                << ".\n";
+
+            return static_cast<ULONG>(
+                kCallbackFunctionOffset);
+        }
+
+        ULONG offset = 0;
+
+        hr = symbols->GetFieldOffset(
+            moduleBase,
+            typeId,
+            "Function",
+            &offset);
+
+        if (FAILED(hr)) {
+            std::cout
+                << "[!] _EX_CALLBACK_ROUTINE_BLOCK::Function offset unavailable; "
+                "falling back to 0x"
+                << std::hex
+                << kCallbackFunctionOffset
+                << std::dec
+                << ".\n";
+
+            return static_cast<ULONG>(
+                kCallbackFunctionOffset);
+        }
+
+        std::cout
+            << "[+] _EX_CALLBACK_ROUTINE_BLOCK::Function resolved at offset 0x"
+            << std::hex
+            << offset
+            << std::dec
+            << ".\n";
+
+        return offset;
+    }
+
+    /*
+     * ------------------------------------------------------------
      * Print driver enumeration diagnostics.
      * ------------------------------------------------------------
      */
@@ -541,11 +608,12 @@ namespace {
      * ------------------------------------------------------------
      */
 
-    void EnumerateCallbackArray(
+    bool EnumerateCallbackArray(
         IDebugSymbols3* symbols,
         IDebugDataSpaces* dataSpaces,
         const std::vector<DriverInfo>& drivers,
-        const CallbackArraySpec& spec)
+        const CallbackArraySpec& spec,
+        ULONG callbackFunctionOffset)
     {
         ULONG64 arrayBase = 0;
 
@@ -568,7 +636,7 @@ namespace {
                 << std::nouppercase
                 << ")\n";
 
-            return;
+            return false;
         }
 
         std::array<ULONG64, kCallbackSlots> entries{};
@@ -586,7 +654,7 @@ namespace {
                 "ReadVirtual(callback array)",
                 hr);
 
-            return;
+            return false;
         }
 
         const std::size_t readableSlots =
@@ -662,7 +730,7 @@ namespace {
                 ReadU64(
                     dataSpaces,
                     block +
-                    kCallbackFunctionOffset,
+                    callbackFunctionOffset,
                     callback);
 
             std::string owner;
@@ -736,6 +804,8 @@ namespace {
             << "\nActive entries: "
             << active
             << "\n";
+
+        return true;
     }
 
 } // namespace
@@ -896,6 +966,13 @@ int main()
     }
 
     /*
+     * The reload warning above is non-fatal; clear hr so it does
+     * not leak into the final exit code, and track enumeration
+     * outcomes explicitly below.
+     */
+    hr = S_OK;
+
+    /*
      * Do NOT rely on DbgEng's module list here.
      *
      * Enumerate loaded drivers independently through PSAPI.
@@ -911,12 +988,36 @@ int main()
         PrintDriverStatistics(
             drivers);
 
+        const ULONG callbackFunctionOffset =
+            ResolveCallbackFunctionOffset(
+                symbols);
+
+        std::cout
+            << "[!] Assuming Windows uses "
+            << kCallbackSlots
+            << " slots per process/thread/image callback array; "
+            "this layout is undocumented and may change between builds.\n";
+
+        std::size_t enumerationsFailed = 0;
+
         for (const auto& spec : kArrays) {
-            EnumerateCallbackArray(
-                symbols,
-                dataSpaces,
-                drivers,
-                spec);
+            if (!EnumerateCallbackArray(
+                    symbols,
+                    dataSpaces,
+                    drivers,
+                    spec,
+                    callbackFunctionOffset))
+            {
+                ++enumerationsFailed;
+            }
+        }
+
+        if (enumerationsFailed > 0) {
+            std::cerr
+                << "\n[-] "
+                << enumerationsFailed
+                << " callback array(s) failed to enumerate.\n";
+            hr = E_FAIL;
         }
     }
 
