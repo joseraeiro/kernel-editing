@@ -1,5 +1,7 @@
 # KernelWriteLab
 
+> **Disclaimer:** This tool is provided strictly for educational and authorized security research purposes. It is intended to be used only in isolated, snapshotted, disposable lab virtual machines. Do not use this tool on production systems, corporate networks, or any environment where unauthorized modification of kernel memory could cause harm, data loss, or violate applicable laws and regulations. The authors assume no liability for misuse. By using this software, you agree that you are solely responsible for ensuring you have proper authorization and that your use complies with all applicable laws and your organization's policies.
+
 A lab tool that demonstrates constrained use of `IDebugDataSpaces::WriteVirtual` through the Windows Debugging SDK. It attaches to the local kernel debugger, reads a 64-bit value at a target address, writes a replacement, and reads back the result to verify.
 
 ## What it does
