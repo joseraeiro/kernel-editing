@@ -91,13 +91,17 @@ void PrintValue(const char* label, ULONG64 value) {
 }
 
 void PrintUsage(const char* exeName) {
-    std::cout << "Usage: " << exeName << " [hex-value]\n\n"
-              << "This lab tool attaches to the local kernel debugger, resolves "
-              << kTargetSymbol << ",\n"
-              << "reads the current 64-bit value, writes a replacement value, and reads it again.\n\n"
+    std::cout << "Usage: " << exeName << " [--address hex-addr] [hex-value]\n\n"
+              << "This lab tool attaches to the local kernel debugger, reads the current\n"
+              << "64-bit value at the target, writes a replacement value, and reads it again.\n\n"
+              << "Options:\n"
+              << "  --address hex-addr  Use a raw virtual address instead of resolving\n"
+              << "                      " << kTargetSymbol << " via symbols.\n\n"
               << "Examples:\n"
               << "  " << exeName << "\n"
-              << "  " << exeName << " 0x1234567890ABCDEF\n\n"
+              << "  " << exeName << " 0x1234567890ABCDEF\n"
+              << "  " << exeName << " --address 0xFFFFF80012345678\n"
+              << "  " << exeName << " --address 0xFFFFF80012345678 0xCAFEBABE\n\n"
               << "Notes:\n"
               << "  * Copy MyLabDriver.pdb to C:\\LabSymbols, or update kDefaultSymbolPath.\n"
               << "  * Run as Administrator after enabling local kernel debugging and rebooting.\n";
@@ -107,22 +111,48 @@ void PrintUsage(const char* exeName) {
 
 int main(int argc, char** argv) {
     ULONG64 requestedValue = kDefaultWriteValue;
+    ULONG64 explicitAddress = 0;
+    bool hasExplicitAddress = false;
 
-    if (argc >= 2) {
-        if (std::string(argv[1]) == "-h" || std::string(argv[1]) == "--help") {
+    int argIndex = 1;
+    while (argIndex < argc) {
+        std::string arg(argv[argIndex]);
+
+        if (arg == "-h" || arg == "--help") {
             PrintUsage(argv[0]);
             return 0;
         }
 
-        if (!ParseHexU64(argv[1], requestedValue)) {
+        if (arg == "--address") {
+            if (argIndex + 1 >= argc) {
+                std::cerr << "[-] --address requires a hex address argument.\n";
+                PrintUsage(argv[0]);
+                return 1;
+            }
+            if (!ParseHexU64(argv[argIndex + 1], explicitAddress)) {
+                std::cerr << "[-] Could not parse the address as a 64-bit integer.\n";
+                PrintUsage(argv[0]);
+                return 1;
+            }
+            hasExplicitAddress = true;
+            argIndex += 2;
+            continue;
+        }
+
+        if (!ParseHexU64(argv[argIndex], requestedValue)) {
             std::cerr << "[-] Could not parse the requested value as a 64-bit integer.\n";
             PrintUsage(argv[0]);
             return 1;
         }
+        ++argIndex;
     }
 
     std::cout << "KernelWriteLab - constrained WriteVirtual demonstration\n";
-    std::cout << "Target symbol: " << kTargetSymbol << "\n";
+    if (hasExplicitAddress) {
+        PrintValue("Target address:    ", explicitAddress);
+    } else {
+        std::cout << "Target symbol: " << kTargetSymbol << "\n";
+    }
     PrintValue("Requested new value:", requestedValue);
     std::cout << "\n";
 
@@ -191,15 +221,21 @@ int main(int argc, char** argv) {
     }
 
     ULONG64 targetAddress = 0;
-    hr = symbols->GetOffsetByName(kTargetSymbol, &targetAddress);
-    if (FAILED(hr)) {
-        PrintHr("GetOffsetByName(MyLabDriver!g_LabValue)", hr);
-        std::cerr << "    Ensure the driver is loaded and its PDB is reachable via the symbol path.\n";
-        goto cleanup;
-    }
+    if (hasExplicitAddress) {
+        targetAddress = explicitAddress;
+        std::cout << "[*] Using explicit address 0x"
+                  << std::hex << targetAddress << std::dec << "\n";
+    } else {
+        hr = symbols->GetOffsetByName(kTargetSymbol, &targetAddress);
+        if (FAILED(hr)) {
+            PrintHr("GetOffsetByName(MyLabDriver!g_LabValue)", hr);
+            std::cerr << "    Ensure the driver is loaded and its PDB is reachable via the symbol path.\n";
+            goto cleanup;
+        }
 
-    std::cout << "[*] Resolved " << kTargetSymbol << " at 0x"
-              << std::hex << targetAddress << std::dec << "\n";
+        std::cout << "[*] Resolved " << kTargetSymbol << " at 0x"
+                  << std::hex << targetAddress << std::dec << "\n";
+    }
 
     ULONG64 before = 0;
     if (!ReadU64(dataSpaces, targetAddress, before)) {
