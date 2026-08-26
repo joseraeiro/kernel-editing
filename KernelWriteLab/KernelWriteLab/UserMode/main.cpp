@@ -16,6 +16,8 @@ namespace {
 constexpr const char* kTargetSymbol = "MyLabDriver!g_LabValue";
 constexpr ULONG64 kDefaultWriteValue = 0xCAFEBABEDEADBEEFULL;
 constexpr const char* kDefaultSymbolPath = "srv*C:\\Symbols*https://msdl.microsoft.com/download/symbols;C:\\LabSymbols";
+constexpr ULONG64 kPointerAlignmentMask = 0x7;
+constexpr ULONG64 kFastRefTagMask = 0xF;
 
 template <typename T>
 void SafeRelease(T*& ptr) {
@@ -96,12 +98,22 @@ void PrintUsage(const char* exeName) {
               << "64-bit value at the target, writes a replacement value, and reads it again.\n\n"
               << "Options:\n"
               << "  --address hex-addr  Use a raw virtual address instead of resolving\n"
-              << "                      " << kTargetSymbol << " via symbols.\n\n"
+              << "                      " << kTargetSymbol << " via symbols.\n"
+              << "                      The address must be 8-byte aligned.\n\n"
               << "Examples:\n"
               << "  " << exeName << "\n"
               << "  " << exeName << " 0x1234567890ABCDEF\n"
-              << "  " << exeName << " --address 0xFFFFF80012345678\n"
-              << "  " << exeName << " --address 0xFFFFF80012345678 0xCAFEBABE\n\n"
+              << "  " << exeName << " --address 0xFFFFF80012345670\n"
+              << "  " << exeName << " --address 0xFFFFF80012345670 0xCAFEBABE\n\n"
+              << "When using addresses from KernelCallbackInspector output:\n"
+              << "  * 'Address' (array base) is the correct column to target a slot.\n"
+              << "    Compute the slot address as: Address + SlotIndex * 8.\n"
+              << "  * 'Encoded entry' contains fast-reference tag bits in the low nibble\n"
+              << "    and must not be used directly as a write destination.\n"
+              << "  * 'Block' points to an internal kernel structure; writing there can\n"
+              << "    corrupt synchronization state or reference counts.\n"
+              << "  * 'Callback' points to executable code; writing there would overwrite\n"
+              << "    instructions rather than change the callback registration.\n\n"
               << "Notes:\n"
               << "  * Copy MyLabDriver.pdb to C:\\LabSymbols, or update kDefaultSymbolPath.\n"
               << "  * Run as Administrator after enabling local kernel debugging and rebooting.\n";
@@ -132,6 +144,16 @@ int main(int argc, char** argv) {
             if (!ParseHexU64(argv[argIndex + 1], explicitAddress)) {
                 std::cerr << "[-] Could not parse the address as a 64-bit integer.\n";
                 PrintUsage(argv[0]);
+                return 1;
+            }
+            if (explicitAddress & kPointerAlignmentMask) {
+                std::cerr << "[-] Address 0x" << std::hex << explicitAddress << std::dec
+                          << " is not 8-byte aligned.\n";
+                if (explicitAddress & kFastRefTagMask) {
+                    std::cerr << "    The low nibble is non-zero, which suggests this may be an\n"
+                              << "    encoded callback entry with fast-reference tag bits.\n"
+                              << "    Use the array base address + slot offset instead.\n";
+                }
                 return 1;
             }
             hasExplicitAddress = true;
