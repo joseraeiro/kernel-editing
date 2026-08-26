@@ -18,6 +18,7 @@ constexpr ULONG64 kDefaultWriteValue = 0xCAFEBABEDEADBEEFULL;
 constexpr const char* kDefaultSymbolPath = "srv*C:\\Symbols*https://msdl.microsoft.com/download/symbols;C:\\LabSymbols";
 constexpr ULONG64 kPointerAlignmentMask = 0x7;
 constexpr ULONG64 kFastRefTagMask = 0xF;
+constexpr int kMaxSlotCount = 64;
 
 template <typename T>
 void SafeRelease(T*& ptr) {
@@ -93,21 +94,27 @@ void PrintValue(const char* label, ULONG64 value) {
 }
 
 void PrintUsage(const char* exeName) {
-    std::cout << "Usage: " << exeName << " [--address hex-addr] [hex-value]\n\n"
+    std::cout << "Usage: " << exeName << " [--address hex-addr] [--count N] [hex-value]\n\n"
               << "This lab tool attaches to the local kernel debugger, reads the current\n"
               << "64-bit value at the target, writes a replacement value, and reads it again.\n\n"
               << "Options:\n"
               << "  --address hex-addr  Use a raw virtual address instead of resolving\n"
               << "                      " << kTargetSymbol << " via symbols.\n"
-              << "                      The address must be 8-byte aligned.\n\n"
+              << "                      The address must be 8-byte aligned.\n"
+              << "  --count N           Write the value to N consecutive 8-byte slots\n"
+              << "                      starting from the target address (max "
+              << kMaxSlotCount << ").\n"
+              << "                      Requires --address.\n\n"
               << "Examples:\n"
               << "  " << exeName << "\n"
               << "  " << exeName << " 0x1234567890ABCDEF\n"
               << "  " << exeName << " --address 0xFFFFF80012345670\n"
-              << "  " << exeName << " --address 0xFFFFF80012345670 0xCAFEBABE\n\n"
+              << "  " << exeName << " --address 0xFFFFF80012345670 0xCAFEBABE\n"
+              << "  " << exeName << " --address 0xFFFFF80012345670 --count 8 0x0\n\n"
               << "When using addresses from KernelCallbackInspector output:\n"
               << "  * 'Address' (array base) is the correct column to target a slot.\n"
               << "    Compute the slot address as: Address + SlotIndex * 8.\n"
+              << "    Use --count to write across multiple consecutive slots.\n"
               << "  * 'Encoded entry' contains fast-reference tag bits in the low nibble\n"
               << "    and must not be used directly as a write destination.\n"
               << "  * 'Block' points to an internal kernel structure; writing there can\n"
@@ -125,6 +132,7 @@ int main(int argc, char** argv) {
     ULONG64 requestedValue = kDefaultWriteValue;
     ULONG64 explicitAddress = 0;
     bool hasExplicitAddress = false;
+    int slotCount = 1;
 
     int argIndex = 1;
     while (argIndex < argc) {
@@ -161,6 +169,23 @@ int main(int argc, char** argv) {
             continue;
         }
 
+        if (arg == "--count") {
+            if (argIndex + 1 >= argc) {
+                std::cerr << "[-] --count requires a numeric argument.\n";
+                PrintUsage(argv[0]);
+                return 1;
+            }
+            char* end = nullptr;
+            long parsed = strtol(argv[argIndex + 1], &end, 10);
+            if (!end || *end != '\0' || parsed < 1 || parsed > kMaxSlotCount) {
+                std::cerr << "[-] --count must be between 1 and " << kMaxSlotCount << ".\n";
+                return 1;
+            }
+            slotCount = static_cast<int>(parsed);
+            argIndex += 2;
+            continue;
+        }
+
         if (!ParseHexU64(argv[argIndex], requestedValue)) {
             std::cerr << "[-] Could not parse the requested value as a 64-bit integer.\n";
             PrintUsage(argv[0]);
@@ -169,9 +194,18 @@ int main(int argc, char** argv) {
         ++argIndex;
     }
 
+    if (slotCount > 1 && !hasExplicitAddress) {
+        std::cerr << "[-] --count requires --address.\n";
+        PrintUsage(argv[0]);
+        return 1;
+    }
+
     std::cout << "KernelWriteLab - constrained WriteVirtual demonstration\n";
     if (hasExplicitAddress) {
         PrintValue("Target address:    ", explicitAddress);
+        if (slotCount > 1) {
+            std::cout << "Slot count:         " << slotCount << " (8 bytes each)\n";
+        }
     } else {
         std::cout << "Target symbol: " << kTargetSymbol << "\n";
     }
@@ -259,27 +293,61 @@ int main(int argc, char** argv) {
                   << std::hex << targetAddress << std::dec << "\n";
     }
 
-    ULONG64 before = 0;
-    if (!ReadU64(dataSpaces, targetAddress, before)) {
-        goto cleanup;
-    }
-    PrintValue("[+] Current value: ", before);
+    {
+        int succeeded = 0;
+        int failed = 0;
 
-    if (!WriteU64(dataSpaces, targetAddress, requestedValue)) {
-        goto cleanup;
-    }
-    std::cout << "[+] WriteVirtual completed successfully.\n";
+        for (int slot = 0; slot < slotCount; ++slot) {
+            ULONG64 slotAddress = targetAddress + slot * sizeof(ULONG64);
 
-    ULONG64 after = 0;
-    if (!ReadU64(dataSpaces, targetAddress, after)) {
-        goto cleanup;
-    }
-    PrintValue("[+] New value:     ", after);
+            if (slotCount > 1) {
+                std::cout << "\n[*] Slot " << slot << " at 0x"
+                          << std::hex << slotAddress << std::dec << "\n";
+            }
 
-    if (after == requestedValue) {
-        std::cout << "[+] Verification successful.\n";
-    } else {
-        std::cout << "[!] Verification mismatch. Investigate symbol correctness and paging state.\n";
+            ULONG64 before = 0;
+            if (!ReadU64(dataSpaces, slotAddress, before)) {
+                ++failed;
+                continue;
+            }
+            PrintValue("[+] Current value: ", before);
+
+            if (!WriteU64(dataSpaces, slotAddress, requestedValue)) {
+                ++failed;
+                continue;
+            }
+
+            ULONG64 after = 0;
+            if (!ReadU64(dataSpaces, slotAddress, after)) {
+                ++failed;
+                continue;
+            }
+            PrintValue("[+] New value:     ", after);
+
+            if (after == requestedValue) {
+                ++succeeded;
+            } else {
+                std::cout << "[!] Verification mismatch at slot " << slot << ".\n";
+                ++failed;
+            }
+        }
+
+        if (slotCount == 1) {
+            std::cout << (failed == 0
+                ? "[+] Verification successful.\n"
+                : "[!] Verification mismatch. Investigate symbol correctness and paging state.\n");
+        } else {
+            std::cout << "\n[*] Summary: " << succeeded << "/" << slotCount
+                      << " slots written and verified";
+            if (failed > 0) {
+                std::cout << ", " << failed << " failed";
+            }
+            std::cout << ".\n";
+        }
+
+        if (failed > 0) {
+            hr = E_FAIL;
+        }
     }
 
 cleanup:
