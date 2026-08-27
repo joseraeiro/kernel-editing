@@ -604,6 +604,281 @@ namespace {
 
     /*
      * ------------------------------------------------------------
+     * Generic type-info helpers.
+     *
+     * All fltmgr / nt struct offsets are looked up dynamically so
+     * a layout change between Windows builds surfaces as a clear
+     * error instead of silent misinterpretation.
+     * ------------------------------------------------------------
+     */
+
+    bool ResolveTypeAndField(
+        IDebugSymbols3* symbols,
+        const char* qualifiedType,
+        const char* field,
+        ULONG& offset)
+    {
+        ULONG typeId = 0;
+        ULONG64 moduleBase = 0;
+
+        HRESULT hr = symbols->GetSymbolTypeId(
+            qualifiedType,
+            &typeId,
+            &moduleBase);
+
+        if (FAILED(hr)) {
+            return false;
+        }
+
+        return SUCCEEDED(
+            symbols->GetFieldOffset(
+                moduleBase,
+                typeId,
+                field,
+                &offset));
+    }
+
+    bool ResolveTypeSize(
+        IDebugSymbols3* symbols,
+        const char* qualifiedType,
+        ULONG& size)
+    {
+        ULONG typeId = 0;
+        ULONG64 moduleBase = 0;
+
+        HRESULT hr = symbols->GetSymbolTypeId(
+            qualifiedType,
+            &typeId,
+            &moduleBase);
+
+        if (FAILED(hr)) {
+            return false;
+        }
+
+        return SUCCEEDED(
+            symbols->GetTypeSize(
+                moduleBase,
+                typeId,
+                &size));
+    }
+
+    /*
+     * ------------------------------------------------------------
+     * Kernel LIST_ENTRY walker.
+     *
+     * Given the head LIST_ENTRY address and the container's field
+     * offset for its embedded LIST_ENTRY, iterate up to maxCount
+     * containers. Stops on:
+     *   * Flink returning to the head       (end of list)
+     *   * Flink == current                  (self-loop)
+     *   * Flink == 0                        (garbage)
+     *   * Flink < listEntryOffsetContainer  (would underflow)
+     *   * ReadVirtual failure               (unmapped memory)
+     *   * maxCount reached                  (runaway)
+     * ------------------------------------------------------------
+     */
+
+    std::vector<ULONG64> WalkListEntries(
+        IDebugDataSpaces* dataSpaces,
+        ULONG64 headAddress,
+        ULONG listEntryOffsetInContainer,
+        std::size_t maxCount)
+    {
+        std::vector<ULONG64> containers;
+
+        ULONG64 firstFlink = 0;
+
+        if (!ReadU64(
+                dataSpaces,
+                headAddress,
+                firstFlink))
+        {
+            return containers;
+        }
+
+        ULONG64 current = firstFlink;
+
+        while (current != headAddress &&
+               containers.size() < maxCount)
+        {
+            if (current < listEntryOffsetInContainer) {
+                break;
+            }
+
+            containers.push_back(
+                current -
+                listEntryOffsetInContainer);
+
+            ULONG64 nextFlink = 0;
+
+            if (!ReadU64(
+                    dataSpaces,
+                    current,
+                    nextFlink))
+            {
+                break;
+            }
+
+            if (nextFlink == 0 ||
+                nextFlink == current)
+            {
+                break;
+            }
+
+            current = nextFlink;
+        }
+
+        return containers;
+    }
+
+    /*
+     * ------------------------------------------------------------
+     * Read a kernel UNICODE_STRING at the given address.
+     *
+     * The buffer is capped at kUnicodeStringByteCap to protect
+     * against a garbage Length field pointing at a huge allocation.
+     * Non-ASCII code points are rendered as '?' since this is a
+     * console tool and driver names are effectively ASCII in
+     * practice.
+     * ------------------------------------------------------------
+     */
+
+    constexpr USHORT kUnicodeStringByteCap = 512;
+
+    #pragma pack(push, 1)
+    struct KernelUnicodeString {
+        USHORT  Length;
+        USHORT  MaximumLength;
+        ULONG   _pad;
+        ULONG64 Buffer;
+    };
+    #pragma pack(pop)
+
+    static_assert(
+        sizeof(KernelUnicodeString) == 16,
+        "UNICODE_STRING x64 layout mismatch");
+
+    std::string ReadUnicodeString(
+        IDebugDataSpaces* dataSpaces,
+        ULONG64 unicodeStringAddress)
+    {
+        KernelUnicodeString us{};
+
+        if (!ReadVirtualExact(
+                dataSpaces,
+                unicodeStringAddress,
+                &us,
+                sizeof(us)))
+        {
+            return "<unreadable>";
+        }
+
+        if (us.Length == 0 ||
+            us.Buffer == 0)
+        {
+            return {};
+        }
+
+        USHORT byteCount = us.Length;
+
+        if (byteCount > kUnicodeStringByteCap) {
+            byteCount = kUnicodeStringByteCap;
+        }
+
+        std::vector<wchar_t> buf(
+            byteCount / sizeof(wchar_t));
+
+        if (!ReadVirtualExact(
+                dataSpaces,
+                us.Buffer,
+                buf.data(),
+                byteCount))
+        {
+            return "<unreadable>";
+        }
+
+        std::string out;
+        out.reserve(buf.size());
+
+        for (wchar_t wc : buf) {
+            if (wc == 0) {
+                break;
+            }
+            if (wc < 128) {
+                out.push_back(
+                    static_cast<char>(wc));
+            }
+            else {
+                out.push_back('?');
+            }
+        }
+
+        return out;
+    }
+
+    /*
+     * ------------------------------------------------------------
+     * IRP major function label.
+     *
+     * Filter Manager pseudo-major functions occupy 0xEC..0xFF
+     * (defined as (UCHAR)-1 through (UCHAR)-20 in fltKernel.h).
+     * ------------------------------------------------------------
+     */
+
+    constexpr UCHAR kIrpMjOperationEnd = 0x80;
+
+    const char* IrpMajorName(UCHAR mj)
+    {
+        switch (mj) {
+        case 0x00: return "IRP_MJ_CREATE";
+        case 0x01: return "IRP_MJ_CREATE_NAMED_PIPE";
+        case 0x02: return "IRP_MJ_CLOSE";
+        case 0x03: return "IRP_MJ_READ";
+        case 0x04: return "IRP_MJ_WRITE";
+        case 0x05: return "IRP_MJ_QUERY_INFORMATION";
+        case 0x06: return "IRP_MJ_SET_INFORMATION";
+        case 0x07: return "IRP_MJ_QUERY_EA";
+        case 0x08: return "IRP_MJ_SET_EA";
+        case 0x09: return "IRP_MJ_FLUSH_BUFFERS";
+        case 0x0a: return "IRP_MJ_QUERY_VOLUME_INFORMATION";
+        case 0x0b: return "IRP_MJ_SET_VOLUME_INFORMATION";
+        case 0x0c: return "IRP_MJ_DIRECTORY_CONTROL";
+        case 0x0d: return "IRP_MJ_FILE_SYSTEM_CONTROL";
+        case 0x0e: return "IRP_MJ_DEVICE_CONTROL";
+        case 0x0f: return "IRP_MJ_INTERNAL_DEVICE_CONTROL";
+        case 0x10: return "IRP_MJ_SHUTDOWN";
+        case 0x11: return "IRP_MJ_LOCK_CONTROL";
+        case 0x12: return "IRP_MJ_CLEANUP";
+        case 0x13: return "IRP_MJ_CREATE_MAILSLOT";
+        case 0x14: return "IRP_MJ_QUERY_SECURITY";
+        case 0x15: return "IRP_MJ_SET_SECURITY";
+        case 0x16: return "IRP_MJ_POWER";
+        case 0x17: return "IRP_MJ_SYSTEM_CONTROL";
+        case 0x18: return "IRP_MJ_DEVICE_CHANGE";
+        case 0x19: return "IRP_MJ_QUERY_QUOTA";
+        case 0x1a: return "IRP_MJ_SET_QUOTA";
+        case 0x1b: return "IRP_MJ_PNP";
+        case 0xff: return "IRP_MJ_ACQUIRE_FOR_SECTION_SYNC";
+        case 0xfe: return "IRP_MJ_RELEASE_FOR_SECTION_SYNC";
+        case 0xfd: return "IRP_MJ_ACQUIRE_FOR_MOD_WRITE";
+        case 0xfc: return "IRP_MJ_RELEASE_FOR_MOD_WRITE";
+        case 0xfb: return "IRP_MJ_ACQUIRE_FOR_CC_FLUSH";
+        case 0xfa: return "IRP_MJ_RELEASE_FOR_CC_FLUSH";
+        case 0xf9: return "IRP_MJ_QUERY_OPEN";
+        case 0xf3: return "IRP_MJ_FAST_IO_CHECK_IF_POSSIBLE";
+        case 0xf2: return "IRP_MJ_NETWORK_QUERY_OPEN";
+        case 0xf1: return "IRP_MJ_MDL_READ";
+        case 0xf0: return "IRP_MJ_MDL_READ_COMPLETE";
+        case 0xef: return "IRP_MJ_PREPARE_MDL_WRITE";
+        case 0xee: return "IRP_MJ_MDL_WRITE_COMPLETE";
+        case 0xed: return "IRP_MJ_VOLUME_MOUNT";
+        case 0xec: return "IRP_MJ_VOLUME_DISMOUNT";
+        default:   return nullptr;
+        }
+    }
+
+    /*
+     * ------------------------------------------------------------
      * Callback array enumeration.
      * ------------------------------------------------------------
      */
@@ -808,6 +1083,328 @@ namespace {
         return true;
     }
 
+    /*
+     * ------------------------------------------------------------
+     * Minifilter enumeration.
+     *
+     * Filter Manager registrations are not a flat array like the
+     * process/thread/image callback tables. Instead, walk from
+     *
+     *   fltmgr!FltGlobals
+     *     .FrameList (LIST_ENTRY head, inside _FLT_RESOURCE_LIST_HEAD)
+     *       -> _FLTP_FRAME
+     *          .RegisteredFilters (LIST_ENTRY head)
+     *              -> _FLT_FILTER
+     *                 .Name (UNICODE_STRING)
+     *                 .DriverObject (_DRIVER_OBJECT*)
+     *                 .Operations   (_FLT_OPERATION_REGISTRATION*)
+     *
+     * The operations array is terminated by MajorFunction == 0x80
+     * (IRP_MJ_OPERATION_END). Every offset is looked up dynamically
+     * because the layouts are undocumented and shift between builds.
+     * ------------------------------------------------------------
+     */
+
+    constexpr std::size_t kMaxFrames = 16;
+    constexpr std::size_t kMaxFiltersPerFrame = 256;
+    constexpr std::size_t kMaxOperationsPerFilter = 64;
+
+    bool EnumerateMinifilters(
+        IDebugSymbols3* symbols,
+        IDebugDataSpaces* dataSpaces,
+        const std::vector<DriverInfo>& drivers)
+    {
+        ULONG64 fltGlobals = 0;
+
+        HRESULT hr = symbols->GetOffsetByName(
+            "fltmgr!FltGlobals",
+            &fltGlobals);
+
+        if (FAILED(hr)) {
+            std::cout
+                << "\n[-] Minifilters: could not resolve fltmgr!FltGlobals "
+                "(HRESULT=0x"
+                << std::hex
+                << std::uppercase
+                << static_cast<unsigned long>(hr)
+                << std::dec
+                << std::nouppercase
+                << "). Ensure fltmgr.sys public symbols are on the symbol path.\n";
+            return false;
+        }
+
+        struct FieldRef {
+            const char* type;
+            const char* field;
+            ULONG*      out;
+        };
+
+        ULONG globalsFrameListOff = 0;
+        ULONG resourceListRListOff = 0;
+        ULONG frameLinksOff = 0;
+        ULONG frameRegisteredFiltersOff = 0;
+        ULONG filterPrimaryLinkOff = 0;
+        ULONG filterNameOff = 0;
+        ULONG filterOperationsOff = 0;
+        ULONG filterDriverObjectOff = 0;
+        ULONG opMajorFunctionOff = 0;
+        ULONG opPreOff = 0;
+        ULONG opPostOff = 0;
+        ULONG driverObjectDriverStartOff = 0;
+
+        const FieldRef fields[] = {
+            {"fltmgr!_GLOBALS",                     "FrameList",         &globalsFrameListOff},
+            {"fltmgr!_FLT_RESOURCE_LIST_HEAD",      "rList",             &resourceListRListOff},
+            {"fltmgr!_FLTP_FRAME",                  "Links",             &frameLinksOff},
+            {"fltmgr!_FLTP_FRAME",                  "RegisteredFilters", &frameRegisteredFiltersOff},
+            {"fltmgr!_FLT_FILTER",                  "PrimaryLink",       &filterPrimaryLinkOff},
+            {"fltmgr!_FLT_FILTER",                  "Name",              &filterNameOff},
+            {"fltmgr!_FLT_FILTER",                  "Operations",        &filterOperationsOff},
+            {"fltmgr!_FLT_FILTER",                  "DriverObject",      &filterDriverObjectOff},
+            {"fltmgr!_FLT_OPERATION_REGISTRATION",  "MajorFunction",     &opMajorFunctionOff},
+            {"fltmgr!_FLT_OPERATION_REGISTRATION",  "PreOperation",      &opPreOff},
+            {"fltmgr!_FLT_OPERATION_REGISTRATION",  "PostOperation",     &opPostOff},
+            {"nt!_DRIVER_OBJECT",                   "DriverStart",       &driverObjectDriverStartOff},
+        };
+
+        for (const auto& f : fields) {
+            if (!ResolveTypeAndField(
+                    symbols,
+                    f.type,
+                    f.field,
+                    *f.out))
+            {
+                std::cerr
+                    << "\n[-] Minifilters: could not resolve "
+                    << f.type
+                    << "::"
+                    << f.field
+                    << ". Filter Manager symbols may be missing or the "
+                    "layout may have changed in this build.\n";
+                return false;
+            }
+        }
+
+        ULONG opRegSize = 0;
+
+        if (!ResolveTypeSize(
+                symbols,
+                "fltmgr!_FLT_OPERATION_REGISTRATION",
+                opRegSize))
+        {
+            std::cerr
+                << "\n[-] Minifilters: could not size "
+                "fltmgr!_FLT_OPERATION_REGISTRATION.\n";
+            return false;
+        }
+
+        const ULONG64 frameListHead =
+            fltGlobals +
+            globalsFrameListOff +
+            resourceListRListOff;
+
+        std::vector<ULONG64> frames =
+            WalkListEntries(
+                dataSpaces,
+                frameListHead,
+                frameLinksOff,
+                kMaxFrames);
+
+        std::cout
+            << "\n=== Minifilters ===\n"
+            << "Symbol : fltmgr!FltGlobals\n"
+            << "Address: 0x"
+            << std::hex << fltGlobals << std::dec << "\n"
+            << "Frames : " << frames.size() << "\n";
+
+        std::size_t frameIndex = 0;
+
+        for (ULONG64 frame : frames) {
+            const ULONG64 filterListHead =
+                frame +
+                frameRegisteredFiltersOff +
+                resourceListRListOff;
+
+            std::vector<ULONG64> filters =
+                WalkListEntries(
+                    dataSpaces,
+                    filterListHead,
+                    filterPrimaryLinkOff,
+                    kMaxFiltersPerFrame);
+
+            std::cout
+                << "\n-- Frame " << frameIndex
+                << " at 0x" << std::hex << frame << std::dec
+                << " (" << filters.size() << " filter(s)) --\n";
+
+            for (ULONG64 filter : filters) {
+                std::string name =
+                    ReadUnicodeString(
+                        dataSpaces,
+                        filter + filterNameOff);
+
+                ULONG64 operations = 0;
+                ReadU64(
+                    dataSpaces,
+                    filter + filterOperationsOff,
+                    operations);
+
+                ULONG64 driverObject = 0;
+                ReadU64(
+                    dataSpaces,
+                    filter + filterDriverObjectOff,
+                    driverObject);
+
+                ULONG64 driverStart = 0;
+
+                if (driverObject) {
+                    ReadU64(
+                        dataSpaces,
+                        driverObject + driverObjectDriverStartOff,
+                        driverStart);
+                }
+
+                std::string filterOwner =
+                    driverStart
+                        ? OwnerFromAddress(drivers, driverStart)
+                        : std::string("<unknown>");
+
+                std::cout
+                    << "\nFilter : "
+                    << (name.empty() ? std::string("<unnamed>") : name)
+                    << "\n"
+                    << "Address    : 0x" << std::hex << filter << std::dec << "\n"
+                    << "Owner      : " << filterOwner << "\n"
+                    << "Operations : 0x" << std::hex << operations << std::dec << "\n";
+
+                if (!operations) {
+                    std::cout
+                        << "  (no operation registration array)\n";
+                    continue;
+                }
+
+                std::cout
+                    << std::left
+                    << std::setw(38) << "IRP major"
+                    << std::setw(19) << "PRE"
+                    << std::setw(19) << "POST"
+                    << std::setw(32) << "Owner"
+                    << "Symbol\n";
+
+                std::cout
+                    << std::string(140, '-')
+                    << "\n";
+
+                std::size_t rowsPrinted = 0;
+
+                for (std::size_t i = 0;
+                     i < kMaxOperationsPerFilter;
+                     ++i)
+                {
+                    const ULONG64 entryAddr =
+                        operations +
+                        static_cast<ULONG64>(i) * opRegSize;
+
+                    UCHAR major = 0;
+
+                    if (!ReadVirtualExact(
+                            dataSpaces,
+                            entryAddr + opMajorFunctionOff,
+                            &major,
+                            sizeof(major)))
+                    {
+                        break;
+                    }
+
+                    if (major == kIrpMjOperationEnd) {
+                        break;
+                    }
+
+                    ULONG64 preCb = 0;
+                    ULONG64 postCb = 0;
+
+                    ReadU64(
+                        dataSpaces,
+                        entryAddr + opPreOff,
+                        preCb);
+
+                    ReadU64(
+                        dataSpaces,
+                        entryAddr + opPostOff,
+                        postCb);
+
+                    if (!preCb && !postCb) {
+                        continue;
+                    }
+
+                    const char* mjName = IrpMajorName(major);
+                    std::ostringstream mjLabel;
+
+                    if (mjName) {
+                        mjLabel << mjName;
+                    }
+                    else {
+                        mjLabel
+                            << "IRP_MJ_0x"
+                            << std::hex
+                            << static_cast<unsigned>(major);
+                    }
+
+                    std::ostringstream preText;
+                    std::ostringstream postText;
+
+                    if (preCb) {
+                        preText << "0x" << std::hex << preCb;
+                    }
+                    else {
+                        preText << "-";
+                    }
+
+                    if (postCb) {
+                        postText << "0x" << std::hex << postCb;
+                    }
+                    else {
+                        postText << "-";
+                    }
+
+                    const ULONG64 primaryCb =
+                        preCb ? preCb : postCb;
+
+                    std::string owner =
+                        OwnerFromAddress(
+                            drivers,
+                            primaryCb);
+
+                    std::string symbol =
+                        SymbolFromAddress(
+                            symbols,
+                            drivers,
+                            primaryCb);
+
+                    std::cout
+                        << std::left
+                        << std::setw(38) << mjLabel.str()
+                        << std::setw(19) << preText.str()
+                        << std::setw(19) << postText.str()
+                        << std::setw(32) << owner
+                        << symbol
+                        << "\n";
+
+                    ++rowsPrinted;
+                }
+
+                if (rowsPrinted == 0) {
+                    std::cout
+                        << "  (operation array present but no non-null callbacks)\n";
+                }
+            }
+
+            ++frameIndex;
+        }
+
+        return true;
+    }
+
 } // namespace
 
 int main()
@@ -966,8 +1563,28 @@ int main()
     }
 
     /*
-     * The reload warning above is non-fatal; clear hr so it does
-     * not leak into the final exit code, and track enumeration
+     * fltmgr symbols are required to enumerate minifilter
+     * registrations; the reload is non-fatal because everything
+     * else (process/thread/image callbacks) still works without
+     * them.
+     */
+    hr = symbols->Reload(
+        "/f fltmgr.sys");
+
+    if (FAILED(hr)) {
+        std::cerr
+            << "[!] fltmgr symbol reload returned HRESULT=0x"
+            << std::hex
+            << std::uppercase
+            << static_cast<unsigned long>(hr)
+            << std::dec
+            << std::nouppercase
+            << "; minifilter enumeration may not resolve types.\n";
+    }
+
+    /*
+     * The reload warnings above are non-fatal; clear hr so they
+     * do not leak into the final exit code, and track enumeration
      * outcomes explicitly below.
      */
     hr = S_OK;
@@ -1012,11 +1629,19 @@ int main()
             }
         }
 
+        if (!EnumerateMinifilters(
+                symbols,
+                dataSpaces,
+                drivers))
+        {
+            ++enumerationsFailed;
+        }
+
         if (enumerationsFailed > 0) {
             std::cerr
                 << "\n[-] "
                 << enumerationsFailed
-                << " callback array(s) failed to enumerate.\n";
+                << " enumeration(s) failed.\n";
             hr = E_FAIL;
         }
     }
