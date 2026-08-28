@@ -1157,7 +1157,6 @@ namespace {
             {"fltmgr!_FLT_RESOURCE_LIST_HEAD",      "rList",             &resourceListRListOff},
             {"fltmgr!_FLTP_FRAME",                  "Links",             &frameLinksOff},
             {"fltmgr!_FLTP_FRAME",                  "RegisteredFilters", &frameRegisteredFiltersOff},
-            {"fltmgr!_FLT_FILTER",                  "PrimaryLink",       &filterPrimaryLinkOff},
             {"fltmgr!_FLT_FILTER",                  "Name",              &filterNameOff},
             {"fltmgr!_FLT_FILTER",                  "Operations",        &filterOperationsOff},
             {"fltmgr!_FLT_FILTER",                  "DriverObject",      &filterDriverObjectOff},
@@ -1183,6 +1182,51 @@ namespace {
                     "layout may have changed in this build.\n";
                 return false;
             }
+        }
+
+        /*
+         * PrimaryLink location varies between Windows builds:
+         *   * Older builds: direct field of _FLT_FILTER.
+         *   * Windows 11+: _FLT_FILTER has an embedded _FLT_OBJECT
+         *     (usually at "Base"), and PrimaryLink is a field inside
+         *     that nested object. GetFieldOffset does not recurse
+         *     into embedded structs, so we resolve it in two steps
+         *     and sum the offsets.
+         */
+        if (!ResolveTypeAndField(
+                symbols,
+                "fltmgr!_FLT_FILTER",
+                "PrimaryLink",
+                filterPrimaryLinkOff))
+        {
+            ULONG baseOff = 0;
+            ULONG linkOff = 0;
+
+            if (!ResolveTypeAndField(
+                    symbols,
+                    "fltmgr!_FLT_FILTER",
+                    "Base",
+                    baseOff) ||
+                !ResolveTypeAndField(
+                    symbols,
+                    "fltmgr!_FLT_OBJECT",
+                    "PrimaryLink",
+                    linkOff))
+            {
+                std::cerr
+                    << "\n[-] Minifilters: could not resolve "
+                    "_FLT_FILTER::PrimaryLink directly or via "
+                    "_FLT_FILTER::Base + _FLT_OBJECT::PrimaryLink. "
+                    "Filter Manager layout may have changed in this build.\n";
+                return false;
+            }
+
+            filterPrimaryLinkOff = baseOff + linkOff;
+
+            std::cout
+                << "[+] _FLT_FILTER::PrimaryLink resolved via "
+                "Base + _FLT_OBJECT::PrimaryLink at offset 0x"
+                << std::hex << filterPrimaryLinkOff << std::dec << ".\n";
         }
 
         ULONG opRegSize = 0;
